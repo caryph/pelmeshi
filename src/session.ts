@@ -58,6 +58,14 @@ export interface AgentMessage {
         input: number;
         output: number;
         cacheRead?: number;
+        cacheWrite?: number;
+        cost?: {
+            input?: number;
+            output?: number;
+            cacheRead?: number;
+            cacheWrite?: number;
+            total?: number;
+        };
     };
     timestamp?: number;
     [key: string]: unknown;
@@ -224,6 +232,8 @@ interface StatsAcc {
     tokensIn: number;
     tokensOut: number;
     cacheRead: number;
+    cost: number;
+    hasCost: boolean;
 }
 
 function extractText(parts: ContentPart[]): string {
@@ -246,6 +256,11 @@ function convertMessage(msg: AgentMessage, out: TranscriptEntry[], stats: StatsA
             stats.tokensIn += msg.usage.input;
             stats.cacheRead += msg.usage.cacheRead ?? 0;
             stats.tokensOut += msg.usage.output;
+            const total = msg.usage.cost?.total;
+            if (typeof total === "number") {
+                stats.cost += total;
+                stats.hasCost = true;
+            }
         }
         const text = extractText(asArray(msg.content).filter((p) => p.type === "text"));
         if (text) out.push({ role: "assistant", text });
@@ -333,7 +348,7 @@ export async function build(input: string, comment: string, redactUser: string):
     const path = activePath(entries);
 
     const transcript: TranscriptEntry[] = [];
-    const stats: StatsAcc = { turns: 0, tokensIn: 0, tokensOut: 0, cacheRead: 0 };
+    const stats: StatsAcc = { turns: 0, tokensIn: 0, tokensOut: 0, cacheRead: 0, cost: 0, hasCost: false };
     for (const e of path) {
         if (e.type === "message" && e.message) {
             convertMessage(e.message, transcript, stats);
@@ -346,7 +361,12 @@ export async function build(input: string, comment: string, redactUser: string):
     const redacted = redactDeep(transcript, redact);
 
     const model = resolveModel(path);
-    const price_usd = model ? await fetchPrice(model.name, stats) : 0;
+    // Prefer provider-reported per-request cost (ground truth, matches OpenRouter
+    // billing incl. provider-specific rates). Fall back to list-price estimate
+    // for sessions recorded before pi tracked cost.
+    const price_usd = stats.hasCost
+        ? Math.round(stats.cost * 10000) / 10000
+        : model ? await fetchPrice(model.name, stats) : 0;
 
     return {
         version: 3,
