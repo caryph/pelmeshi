@@ -1,0 +1,122 @@
+{
+  "version": 3,
+  "tool": {
+    "name": "pi",
+    "version": "0.80.10",
+    "plugins": [
+      "caveman"
+    ]
+  },
+  "model": {
+    "name": "z-ai/glm-5.3-flash",
+    "runtime": "openrouter"
+  },
+  "price_usd": 0.002,
+  "comment": "include price cache read",
+  "description": "",
+  "stats": {
+    "turns": 9,
+    "tokens_in": 16127,
+    "tokens_out": 1885,
+    "cache_read": 42752
+  },
+  "transcript": [
+    {
+      "role": "user",
+      "text": "heya, why does price get miscalculated for my llm saving tool? @README.md i feel like it goes down compared to my actual usage seen in openrouter. are we doing everything right? @README.md"
+    },
+    {
+      "role": "tool",
+      "name": "read"
+    },
+    {
+      "role": "assistant",
+      "text": "README only show schema. Price logic in code. Look."
+    },
+    {
+      "role": "tool",
+      "name": "bash"
+    },
+    {
+      "role": "tool",
+      "name": "read"
+    },
+    {
+      "role": "assistant",
+      "text": "Price calc found. Suspect cache tokens ignored. Check pi usage semantics."
+    },
+    {
+      "role": "tool",
+      "name": "bash"
+    },
+    {
+      "role": "tool",
+      "name": "bash"
+    },
+    {
+      "role": "assistant",
+      "text": "Found. Two things:\n\n1. `usage.input` in pi excludes cache tokens (Anthropic-style: `input` + `cacheRead` separate, confirmed in `docs/custom-provider.md:524-529` and `cache-stats.js:16`).\n2. `fetchPrice` ignores `stats.cacheRead` completely. OpenRouter bills cache reads (cheaper rate, but not free). So price always under-counts, by whatever fraction of prompt was cached — big on agentic sessions where 80%+ tokens cached.\n\nFix: pull `pricing.input_cache_read` from OpenRouter, apply to cached tokens."
+    },
+    {
+      "role": "tool",
+      "name": "edit",
+      "path": "src/session.ts",
+      "diff": [
+        "--- src/session.ts",
+        "+++ src/session.ts",
+        "@@ edit 1 @@",
+        "-    pricing?: {",
+        "-        prompt?: string;",
+        "-        completion?: string;",
+        "-    };",
+        "+    pricing?: {",
+        "+        prompt?: string;",
+        "+        completion?: string;",
+        "+        input_cache_read?: string;",
+        "+    };",
+        "@@ edit 2 @@",
+        "-        const pIn = parseFloat(m.pricing.prompt ?? \"0\");",
+        "-        const pOut = parseFloat(m.pricing.completion ?? \"0\");",
+        "-        const total = pIn * stats.tokensIn + pOut * stats.tokensOut;",
+        "+        const pIn = parseFloat(m.pricing.prompt ?? \"0\");",
+        "+        const pOut = parseFloat(m.pricing.completion ?? \"0\");",
+        "+        // OpenRouter bills cached prompt tokens at a (usually discounted) cache rate.",
+        "+        // usage.input excludes cached tokens, so price them separately.",
+        "+        const pCache = parseFloat(m.pricing.input_cache_read ?? m.pricing.prompt ?? \"0\");",
+        "+        const total =",
+        "+            pIn * stats.tokensIn",
+        "+            + pCache * stats.cacheRead",
+        "+            + pOut * stats.tokensOut;"
+      ]
+    },
+    {
+      "role": "tool",
+      "name": "read"
+    },
+    {
+      "role": "tool",
+      "name": "edit",
+      "path": "todo.md",
+      "diff": [
+        "--- todo.md",
+        "+++ todo.md",
+        "@@ edit 1 @@",
+        "-## open",
+        "+## open",
+        "+- cache_write tokens not tracked in stats (pi usage has cacheWrite; billed at some models at prompt rate or premium, e.g. Anthropic 1.25x). schema v3 would need new field."
+      ]
+    },
+    {
+      "role": "assistant",
+      "text": "Verify field exists on OpenRouter:"
+    },
+    {
+      "role": "tool",
+      "name": "bash"
+    },
+    {
+      "role": "assistant",
+      "text": "Confirmed. `input_cache_read` real field. Summary:\n\n**Bug**: `fetchPrice` only counted `tokensIn` + `tokensOut`. But pi `usage.input` excludes cached prompt tokens (Anthropic-style — confirmed in pi `docs/custom-provider.md`: `input` + `cacheRead` + `cacheWrite` = prompt total). Agentic sessions = 80-90% of prompt tokens cached. Those went into your OpenRouter bill, not into your price calc → price lower than actual.\n\n**Fix** (`src/session.ts`):\n```ts\nconst pCache = parseFloat(m.pricing.input_cache_read ?? m.pricing.prompt ?? \"0\");\nconst total =\n    pIn * stats.tokensIn\n    + pCache * stats.cacheRead\n    + pOut * stats.tokensOut;\n```\n\nNote cache rate can be 40x cheaper (Claude: $0.25/MTok cache vs $10/MTok prompt), so cache tokens cheap but not free. Fallback = prompt rate if field missing.\n\n**Still open** (added to todo.md): `cacheWrite` not tracked — pi reports it, some models bill it at premium (Anthropic 1.25x). Schema v3 has no field; needs version bump if you want it."
+    }
+  ]
+}

@@ -299,6 +299,7 @@ interface OpenRouterModel {
     pricing?: {
         prompt?: string;
         completion?: string;
+        input_cache_read?: string;
     };
 }
 
@@ -315,7 +316,11 @@ async function fetchPrice(modelId: string, stats: StatsAcc): Promise<number> {
 
         const pIn = parseFloat(m.pricing.prompt ?? "0");
         const pOut = parseFloat(m.pricing.completion ?? "0");
-        const total = pIn * stats.tokensIn + pOut * stats.tokensOut;
+        const pCache = parseFloat(m.pricing.input_cache_read ?? m.pricing.prompt ?? "0");
+        const total =
+            pIn * stats.tokensIn
+            + pCache * stats.cacheRead
+            + pOut * stats.tokensOut;
         return Math.round(total * 10000) / 10000;
     } catch {
         return 0;
