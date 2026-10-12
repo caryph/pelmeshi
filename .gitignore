@@ -3,3 +3,4 @@ node_modules/
 store/
 format.json
 todo.md
+.claude-plugin/types/

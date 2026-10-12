@@ -2,6 +2,7 @@ import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { join, resolve } from "node:path";
 import { homedir, userInfo } from "node:os";
+import { buildClaude, type ClaudeEntry } from "./claude.ts";
 
 export interface ToolMeta {
     name: string;
@@ -28,10 +29,11 @@ export type TranscriptEntry =
     | { role: "summary"; text: string };
 
 export interface SessionJson {
-    version: 3;
+    version: 4;
     tool: ToolMeta;
     model: ModelMeta | null;
     price_usd: number;
+    subscription: string | null;
     comment: string;
     description: string;
     stats: Stats;
@@ -105,6 +107,7 @@ export interface Options {
     outDir: string;
     comment: string;
     redactUser: string;
+    subscription?: string | null;
 }
 
 export function fail(msg: string, code = 1): never {
@@ -164,7 +167,7 @@ export function suffix(comment: string): string {
     return slug || randomUUID().split("-")[0];
 }
 
-function parseSession(content: string): FileEntry[] {
+function parseLines(content: string): FileEntry[] {
     const entries: FileEntry[] = [];
     for (const line of content.split("\n")) {
         const trimmed = line.trim();
@@ -176,7 +179,6 @@ function parseSession(content: string): FileEntry[] {
         }
     }
     if (entries.length === 0) fail("empty session file");
-    if (entries[0].type !== "session") fail("not a pi session file");
     return entries;
 }
 
@@ -203,13 +205,10 @@ function asArray(content: string | ContentPart[] | undefined): ContentPart[] {
     return typeof content === "string" ? [{ type: "text", text: content }] : content;
 }
 
-function renderEditDiff(path: string, args: Record<string, unknown>): string[] {
-    const edits = Array.isArray(args.edits) ? (args.edits as Array<Record<string, unknown>>) : [];
+export function renderDiff(path: string, edits: Array<[string, string]>): string[] {
     const lines: string[] = [`--- ${path}`, `+++ ${path}`];
     for (let i = 0; i < edits.length; i++) {
-        const edit = edits[i];
-        const oldText = String(edit.oldText ?? "");
-        const newText = String(edit.newText ?? "");
+        const [oldText, newText] = edits[i];
         lines.push(`@@ edit ${i + 1} @@`);
         for (const l of oldText.split("\n")) lines.push(`-${l}`);
         for (const l of newText.split("\n")) lines.push(`+${l}`);
@@ -219,7 +218,9 @@ function renderEditDiff(path: string, args: Record<string, unknown>): string[] {
 
 function toolEntry(name: string, args: Record<string, unknown>): TranscriptEntry {
     if (name === "edit" && typeof args.path === "string") {
-        return { role: "tool", name: "edit", path: args.path, diff: renderEditDiff(args.path, args) };
+        const edits = Array.isArray(args.edits) ? (args.edits as Array<Record<string, unknown>>) : [];
+        const pairs = edits.map((e): [string, string] => [String(e.oldText ?? ""), String(e.newText ?? "")]);
+        return { role: "tool", name: "edit", path: args.path, diff: renderDiff(args.path, pairs) };
     }
     if (name === "write" && typeof args.path === "string") {
         return { role: "tool", name: "write", path: args.path, content: String(args.content ?? "") };
@@ -309,41 +310,64 @@ function piVersion(): string {
     return "unknown";
 }
 
+export interface OpenRouterPricing {
+    prompt?: string;
+    completion?: string;
+    input_cache_read?: string;
+    input_cache_write?: string;
+    input_cache_write_1h?: string;
+}
+
 interface OpenRouterModel {
     id: string;
-    pricing?: {
-        prompt?: string;
-        completion?: string;
-        input_cache_read?: string;
-    };
+    pricing?: OpenRouterPricing;
+}
+
+let openRouterModels: Promise<OpenRouterModel[]> | undefined;
+
+export async function fetchPricing(modelId: string): Promise<OpenRouterPricing | null> {
+    openRouterModels ??= fetch("https://openrouter.ai/api/v1/models", { signal: AbortSignal.timeout(10_000) })
+        .then(async (res) => {
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            return ((await res.json()) as { data?: OpenRouterModel[] }).data ?? [];
+        })
+        .catch((e) => {
+            console.error(`pelmeshi: couldn't fetch OpenRouter pricing (${e instanceof Error ? e.message : e}), price will be 0`);
+            return [];
+        });
+    const m = (await openRouterModels).find((x) => x.id === modelId);
+    return m?.pricing ?? null;
+}
+
+export function roundUsd(n: number): number {
+    return Math.round(n * 10000) / 10000;
 }
 
 async function fetchPrice(modelId: string, stats: StatsAcc): Promise<number> {
-    try {
-        const res = await fetch("https://openrouter.ai/api/v1/models", {
-            signal: AbortSignal.timeout(10_000),
-        });
-        if (!res.ok) return 0;
-        const data = (await res.json()) as { data?: OpenRouterModel[] };
-        const models = data.data ?? [];
-        const m = models.find((x) => x.id === modelId);
-        if (!m?.pricing) return 0;
+    const pricing = await fetchPricing(modelId);
+    if (!pricing) return 0;
 
-        const pIn = parseFloat(m.pricing.prompt ?? "0");
-        const pOut = parseFloat(m.pricing.completion ?? "0");
-        const pCache = parseFloat(m.pricing.input_cache_read ?? m.pricing.prompt ?? "0");
-        const total =
-            pIn * stats.tokensIn
-            + pCache * stats.cacheRead
-            + pOut * stats.tokensOut;
-        return Math.round(total * 10000) / 10000;
-    } catch {
-        return 0;
-    }
+    const pIn = parseFloat(pricing.prompt ?? "0");
+    const pOut = parseFloat(pricing.completion ?? "0");
+    const pCache = parseFloat(pricing.input_cache_read ?? pricing.prompt ?? "0");
+    const total =
+        pIn * stats.tokensIn
+        + pCache * stats.cacheRead
+        + pOut * stats.tokensOut;
+    return roundUsd(total);
 }
 
-export async function build(input: string, comment: string, redactUser: string): Promise<SessionJson> {
-    const entries = parseSession(readFileSync(input, "utf8"));
+// subscription: plan name, null for pay-as-you-go, undefined to detect (Claude Code only)
+export async function build(input: string, comment: string, redactUser: string, subscription?: string | null): Promise<SessionJson> {
+    const entries = parseLines(readFileSync(input, "utf8"));
+    if (entries[0].type === "session") return buildPi(entries, comment, redactUser);
+    if (entries.some((e) => (e.type === "user" || e.type === "assistant") && typeof e.sessionId === "string")) {
+        return buildClaude(entries as ClaudeEntry[], comment, redactUser, subscription);
+    }
+    return fail("unrecognized session format (expected a pi or Claude Code session)");
+}
+
+async function buildPi(entries: FileEntry[], comment: string, redactUser: string): Promise<SessionJson> {
     const cwd = (entries[0] as SessionHeader).cwd ?? "";
     const path = activePath(entries);
 
@@ -365,14 +389,15 @@ export async function build(input: string, comment: string, redactUser: string):
     // billing incl. provider-specific rates). Fall back to list-price estimate
     // for sessions recorded before pi tracked cost.
     const price_usd = stats.hasCost
-        ? Math.round(stats.cost * 10000) / 10000
+        ? roundUsd(stats.cost)
         : model ? await fetchPrice(model.name, stats) : 0;
 
     return {
-        version: 3,
+        version: 4,
         tool: { name: "pi", version: piVersion(), plugins: resolvePlugins(path) },
         model,
         price_usd,
+        subscription: null,
         comment: redact(comment),
         description: "",
         stats: { turns: stats.turns, tokens_in: stats.tokensIn, tokens_out: stats.tokensOut, cache_read: stats.cacheRead },
@@ -380,14 +405,14 @@ export async function build(input: string, comment: string, redactUser: string):
     };
 }
 
-export async function exportSession(input: string, outDir: string, comment: string, redactUser: string): Promise<string> {
+export async function exportSession(input: string, outDir: string, comment: string, redactUser: string, subscription?: string | null): Promise<string> {
     const inputPath = resolve(input);
     if (!existsSync(inputPath)) fail(`input not found: ${inputPath}`, 2);
 
     const outDirAbs = resolve(outDir);
     mkdirSync(outDirAbs, { recursive: true });
 
-    const json = await build(inputPath, comment, redactUser);
+    const json = await build(inputPath, comment, redactUser, subscription);
     const slug = comment.trim() ? suffix(comment) : randomUUID();
     const outFile = join(outDirAbs, `${stamp()}_${slug}.json`);
     writeFileSync(outFile, `${JSON.stringify(json, null, 2)}\n`);

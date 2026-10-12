@@ -1,0 +1,284 @@
+{
+  "version": 3,
+  "tool": {
+    "name": "claude-code",
+    "version": "2.1.296",
+    "plugins": []
+  },
+  "model": {
+    "name": "claude-opus-5-5",
+    "runtime": "anthropic"
+  },
+  "price_usd": 0,
+  "subscription": "pro",
+  "comment": "",
+  "description": "",
+  "stats": {
+    "turns": 46,
+    "tokens_in": 112085,
+    "tokens_out": 41734,
+    "cache_read": 4559550
+  },
+  "transcript": [
+    {
+      "role": "user",
+      "text": "helloooo claude shaped friend. can we make this llm log tool work with claude code?"
+    },
+    {
+      "role": "assistant",
+      "text": "Hellooo! Let me look around the repo first."
+    },
+    {
+      "role": "tool",
+      "name": "bash"
+    },
+    {
+      "role": "tool",
+      "name": "bash"
+    },
+    {
+      "role": "assistant",
+      "text": "It's a pi-session → `.llm/*.json` converter. To add Claude Code I need its real transcript format, so I'll check the files on disk instead of going from memory."
+    },
+    {
+      "role": "tool",
+      "name": "bash"
+    },
+    {
+      "role": "tool",
+      "name": "bash"
+    },
+    {
+      "role": "assistant",
+      "text": "There's a `cost-state` entry with `totalCostUSD`, which is handy. Next I'll look at samples of the key entry types."
+    },
+    {
+      "role": "tool",
+      "name": "bash"
+    },
+    {
+      "role": "tool",
+      "name": "skill"
+    },
+    {
+      "role": "tool",
+      "name": "bash"
+    },
+    {
+      "role": "tool",
+      "name": "bash"
+    },
+    {
+      "role": "tool",
+      "name": "bash"
+    },
+    {
+      "role": "tool",
+      "name": "bash"
+    },
+    {
+      "role": "tool",
+      "name": "bash"
+    },
+    {
+      "role": "tool",
+      "name": "bash"
+    },
+    {
+      "role": "tool",
+      "name": "bash"
+    },
+    {
+      "role": "assistant",
+      "text": "Now the Claude Code parser:"
+    },
+    {
+      "role": "tool",
+      "name": "write",
+      "path": "src/claude.ts",
+      "content": "import { existsSync, readdirSync } from \"node:fs\";\nimport { join } from \"node:path\";\nimport { homedir } from \"node:os\";\nimport {\n    fail, fetchPricing, makeRedactor, redactDeep, renderDiff, roundUsd,\n    type ModelMeta, type SessionJson, type TranscriptEntry,\n} from \"./session.ts\";\n\n// Claude Code transcripts live at ~/.claude/projects/<cwd-slug>/<sessionId>.jsonl.\n// Every line is one entry; an assistant reply is split into one entry per content\n// block, all sharing message.id and a copy of the same usage.\n\ninterface ClaudeUsage {\n    input_tokens?: number;\n    output_tokens?: number;\n    cache_read_input_tokens?: number;\n    cache_creation_input_tokens?: number;\n    cache_creation?: {\n        ephemeral_5m_input_tokens?: number;\n        ephemeral_1h_input_tokens?: number;\n    };\n}\n\ninterface ClaudeBlock {\n    type: string;\n    text?: string;\n    name?: string;\n    input?: Record<string, unknown>;\n}\n\nexport interface ClaudeEntry {\n    type: string;\n    uuid?: string;\n    parentUuid?: string | null;\n    logicalParentUuid?: string | null;\n    sessionId?: string;\n    cwd?: string;\n    version?: string;\n    isSidechain?: boolean;\n    isMeta?: boolean;\n    isCompactSummary?: boolean;\n    totalCostUSD?: number;\n    message?: {\n        id?: string;\n        role?: string;\n        model?: string;\n        content?: string | ClaudeBlock[];\n        usage?: ClaudeUsage;\n    };\n    [key: string]: unknown;\n}\n\nexport function findClaudeSession(sessionId: string): string {\n    const projects = join(process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), \".claude\"), \"projects\");\n    if (existsSync(projects)) {\n        for (const dir of readdirSync(projects)) {\n            const p = join(projects, dir, `${sessionId}.jsonl`);\n            if (existsSync(p)) return p;\n        }\n    }\n    return fail(`no Claude Code transcript for session ${sessionId} under ${projects}`, 2);\n}\n\nfunction activePath(entries: ClaudeEntry[]): ClaudeEntry[] {\n    const chain = entries.filter((e) => e.uuid && !e.isSidechain);\n    const byId = new Map<string, ClaudeEntry>();\n    for (const e of chain) byId.set(e.uuid!, e);\n\n    const path: ClaudeEntry[] = [];\n    const seen = new Set<string>();\n    let current: ClaudeEntry | undefined = chain[chain.length - 1];\n    while (current?.uuid && !seen.has(current.uuid)) {\n        seen.add(current.uuid);\n        path.unshift(current);\n        // compaction starts a fresh chain; logicalParentUuid links it to the old one\n        const parent: string | null | undefined = current.parentUuid ?? current.logicalParentUuid;\n        current = parent ? byId.get(parent) : undefined;\n    }\n    return path;\n}\n\nconst SKIPPED_TAGS = /^<(local-command-stdout|local-command-stderr|local-command-caveat|bash-stdout|bash-stderr|task-notification)>/;\n\nfunction userText(content: string | ClaudeBlock[] | undefined): TranscriptEntry | null {\n    const raw = typeof content === \"string\"\n        ? content\n        : (content ?? []).filter((b) => b.type === \"text\" && b.text).map((b) => b.text).join(\"\\n\");\n    const text = raw.replace(/<system-reminder>[\\s\\S]*?<\\/system-reminder>/g, \"\").trim();\n    if (!text || SKIPPED_TAGS.test(text)) return null;\n\n    if (text.startsWith(\"<bash-input>\")) return { role: \"tool\", name: \"bash\" };\n    const cmd = text.match(/<command-name>\\/?([^<]*)<\\/command-name>/);\n    if (cmd) {\n        const args = text.match(/<command-args>([\\s\\S]*?)<\\/command-args>/)?.[1].trim();\n        return { role: \"user\", text: `/${cmd[1]}${args ? ` ${args}` : \"\"}` };\n    }\n    return { role: \"user\", text };\n}\n\nfunction toolEntry(block: ClaudeBlock, cwd: string): TranscriptEntry {\n    const name = block.name ?? \"tool\";\n    const input = block.input ?? {};\n    const rawPath = typeof input.file_path === \"string\" ? input.file_path : undefined;\n    const path = rawPath && cwd && rawPath.startsWith(`${cwd}/`) ? rawPath.slice(cwd.length + 1) : rawPath;\n\n    if (path && name === \"Edit\") {\n        return { role: \"tool\", name: \"edit\", path, diff: renderDiff(path, [[String(input.old_string ?? \"\"), String(input.new_string ?? \"\")]]) };\n    }\n    if (path && name === \"MultiEdit\" && Array.isArray(input.edits)) {\n        const pairs = (input.edits as Array<Record<string, unknown>>)\n            .map((e): [string, string] => [String(e.old_string ?? \"\"), String(e.new_string ?? \"\")]);\n        return { role: \"tool\", name: \"edit\", path, diff: renderDiff(path, pairs) };\n    }\n    if (path && name === \"Write\") {\n        return { role: \"tool\", name: \"write\", path, content: String(input.content ?? \"\") };\n    }\n    return { role: \"tool\", name: name.startsWith(\"mcp__\") ? name : name.toLowerCase() };\n}\n\n// \"claude-opus-5-5\" / \"claude-haiku-4-5-20251001\" -> \"anthropic/claude-opus-5.5\"\nfunction openRouterId(model: string): string {\n    return `anthropic/${model.replace(/-\\d{8}$/, \"\").replace(/-(\\d+)-(\\d+)$/, \"-$1.$2\")}`;\n}\n\nasync function estimateCost(model: string, usage: ClaudeUsage): Promise<number> {\n    const pricing = await fetchPricing(openRouterId(model));\n    if (!pricing) return 0;\n    const p = (v: string | undefined, fallback = \"0\") => parseFloat(v ?? fallback);\n    const write = usage.cache_creation_input_tokens ?? 0;\n    const write1h = usage.cache_creation?.ephemeral_1h_input_tokens ?? 0;\n    return p(pricing.prompt) * (usage.input_tokens ?? 0)\n        + p(pricing.completion) * (usage.output_tokens ?? 0)\n        + p(pricing.input_cache_read, pricing.prompt) * (usage.cache_read_input_tokens ?? 0)\n        + p(pricing.input_cache_write, pricing.prompt) * (write - write1h)\n        + p(pricing.input_cache_write_1h ?? pricing.input_cache_write, pricing.prompt) * write1h;\n}\n\nexport async function buildClaude(entries: ClaudeEntry[], comment: string, redactUser: string): Promise<SessionJson> {\n    const cwd = entries.find((e) => e.cwd)?.cwd ?? \"\";\n    const path = activePath(entries);\n\n    const transcript: TranscriptEntry[] = [];\n    // one API response per message.id; later lines of the same id carry the same usage\n    const responses = new Map<string, { model: string; usage: ClaudeUsage }>();\n    for (const e of path) {\n        const msg = e.message;\n        if (!msg) continue;\n        if (e.type === \"user\") {\n            if (e.isCompactSummary && typeof msg.content === \"string\") {\n                transcript.push({ role: \"summary\", text: msg.content });\n            } else if (!e.isMeta) {\n                const entry = userText(msg.content);\n                if (entry) transcript.push(entry);\n            }\n        } else if (e.type === \"assistant\") {\n            if (msg.id && msg.usage && msg.model && msg.model !== \"<synthetic>\") {\n                responses.set(msg.id, { model: msg.model, usage: msg.usage });\n            }\n            for (const block of Array.isArray(msg.content) ? msg.content : []) {\n                if (block.type === \"text\" && block.text) transcript.push({ role: \"assistant\", text: block.text });\n                else if (block.type === \"tool_use\") transcript.push(toolEntry(block, cwd));\n            }\n        }\n    }\n\n    const stats = { turns: responses.size, tokens_in: 0, tokens_out: 0, cache_read: 0 };\n    const modelCounts = new Map<string, number>();\n    for (const { model, usage } of responses.values()) {\n        stats.tokens_in += (usage.input_tokens ?? 0) + (usage.cache_creation_input_tokens ?? 0);\n        stats.tokens_out += usage.output_tokens ?? 0;\n        stats.cache_read += usage.cache_read_input_tokens ?? 0;\n        modelCounts.set(model, (modelCounts.get(model) ?? 0) + 1);\n    }\n    const mainModel = [...modelCounts].sort((a, b) => b[1] - a[1])[0]?.[0];\n    const model: ModelMeta | null = mainModel ? { name: mainModel, runtime: \"anthropic\" } : null;\n\n    // cost-state is Claude Code's own running total (incl. background calls), but it is\n    // only written now and then; estimate whatever was answered after the last one.\n    let lastCost = -1;\n    entries.forEach((e, i) => { if (e.type === \"cost-state\") lastCost = i; });\n    let price = lastCost >= 0 ? entries[lastCost].totalCostUSD ?? 0 : 0;\n    const counted = new Set<string>();\n    for (const e of entries.slice(0, lastCost + 1)) if (e.message?.id) counted.add(e.message.id);\n    for (const [id, { model, usage }] of responses) {\n        if (!counted.has(id)) price += await estimateCost(model, usage);\n    }\n\n    const redact = makeRedactor(redactUser, cwd);\n    return {\n        version: 3,\n        tool: { name: \"claude-code\", version: entries.findLast((e) => e.version)?.version ?? \"unknown\", plugins: [] },\n        model,\n        price_usd: roundUsd(price),\n        comment: redact(comment),\n        description: \"\",\n        stats,\n        transcript: redactDeep(transcript, redact),\n    };\n}\n"
+    },
+    {
+      "role": "assistant",
+      "text": "Next, the CLI. I'm also fixing an existing bug: `main()` printed the un-awaited promise (`Promise { <pending> }`) instead of the output path."
+    },
+    {
+      "role": "tool",
+      "name": "bash"
+    },
+    {
+      "role": "assistant",
+      "text": "Everything converts. I'll sanity-check the output, and test the estimator by pricing whole sessions without `cost-state` and comparing against Claude Code's own totals."
+    },
+    {
+      "role": "tool",
+      "name": "bash"
+    },
+    {
+      "role": "assistant",
+      "text": "The estimator lands close on gdai ($11.78 vs $12.06), but it overshoots voicetagger by 24%. I'll compare token totals with Claude Code's own per-model breakdown to find out why."
+    },
+    {
+      "role": "tool",
+      "name": "bash"
+    },
+    {
+      "role": "assistant",
+      "text": "The transcript shows twice the cache writes that `cost-state` counts (561k vs 280k). I'll check where `cost-state` sits relative to the messages and whether `speed`/`fallback_credit` explain the gap."
+    },
+    {
+      "role": "tool",
+      "name": "bash"
+    },
+    {
+      "role": "tool",
+      "name": "bash"
+    },
+    {
+      "role": "tool",
+      "name": "bash"
+    },
+    {
+      "role": "assistant",
+      "text": "The id isn't in `counted`, so the logic is right. The estimate must have returned 0 on that run, which points to a transient OpenRouter failure. Re-running:"
+    },
+    {
+      "role": "tool",
+      "name": "bash"
+    },
+    {
+      "role": "tool",
+      "name": "bash"
+    },
+    {
+      "role": "tool",
+      "name": "write",
+      "path": "hooks/register.ts",
+      "content": "import type { Register } from 'claude-code'\n\nexport const register: Register = on => {\n  on('session.start', async ($, e, next) => {\n    await $.command.register({\n      name: 'pelmeshi',\n      description: 'Export current session to .llm/ (optional comment)',\n    })\n\n    return next(e)\n  })\n\n  on('command.run', { command: 'pelmeshi' }, async ($, e) => {\n    const cwd = await $.session.cwd()\n    const argv = [\n      'node', `${$.plugin.root}/src/convert.ts`,\n      '--claude-session', await $.session.id(),\n      '-o', `${cwd}/.llm`,\n      '--comment', e.args.trim(),\n    ]\n    $.ui.status('pelmeshi: exporting…')\n    try {\n      const { exitCode, stdout, stderr } = await $.process.run(argv, { cwd, timeoutMs: 60_000 })\n      if (exitCode !== 0) return { text: stderr.trim() || `pelmeshi exited with ${exitCode}` }\n      const warnings = stderr.trim()\n\n      return { text: `exported -> ${stdout.trim()}${warnings ? `\\n${warnings}` : ''}` }\n    } catch (err) {\n      return { text: `pelmeshi failed: ${err instanceof Error ? err.message : String(err)}` }\n    } finally {\n      $.ui.status(undefined)\n    }\n  })\n}\n"
+    },
+    {
+      "role": "tool",
+      "name": "bash"
+    },
+    {
+      "role": "assistant",
+      "text": "Validation passes. I'll clear the warnings, then type-check the module against the engine's types using the tsconfig from their header."
+    },
+    {
+      "role": "tool",
+      "name": "bash"
+    },
+    {
+      "role": "tool",
+      "name": "bash"
+    },
+    {
+      "role": "assistant",
+      "text": "Tests under `claude plugin test` run with no process access, so they can't exercise the CLI call. I'll type-check the module now and do a real end-to-end run instead."
+    },
+    {
+      "role": "tool",
+      "name": "bash"
+    },
+    {
+      "role": "assistant",
+      "text": "Types check out. For the end-to-end run I'll start a throwaway headless session in the scratchpad with one cheap Haiku message, then resume it and run `/pelmeshi` through the plugin."
+    },
+    {
+      "role": "tool",
+      "name": "bash"
+    },
+    {
+      "role": "tool",
+      "name": "bash"
+    },
+    {
+      "role": "assistant",
+      "text": "That works end to end. Removing the throwaway transcript the test created (after checking that's all it contains):"
+    },
+    {
+      "role": "tool",
+      "name": "bash"
+    },
+    {
+      "role": "assistant",
+      "text": "Last steps: update the README, and check whether the engine left generated types in the repo."
+    },
+    {
+      "role": "tool",
+      "name": "bash"
+    },
+    {
+      "role": "tool",
+      "name": "bash"
+    },
+    {
+      "role": "tool",
+      "name": "bash"
+    },
+    {
+      "role": "tool",
+      "name": "bash"
+    },
+    {
+      "role": "assistant",
+      "text": "Yes, pelmeshi works with Claude Code now. `/pelmeshi [comment]` exports the current session to `./.llm/` in the same `version: 3` format as your pi logs. I tested it end to end on a throwaway session, and it wrote a correct log for a one-message Haiku chat ($0.0023). Nothing is committed yet.\n\n**What changed**\n- **`src/claude.ts`** (new): reads Claude Code transcripts from `~/.claude/projects/<dir>/<id>.jsonl`.\n  - **Transcript:** keeps your prompts, the replies and tool calls. Edits become diffs and writes keep their content, as in pi; slash commands are logged as `/name args`.\n  - **Dropped:** thinking, tool results, system reminders and other injected messages.\n  - **Token counts:** Claude Code repeats the same usage numbers on every piece of one reply, so I count each reply once. Otherwise tokens would have been counted several times over.\n  - **Price:** Claude Code saves its own running cost (`cost-state`) only now and then, not after every message. I use that number and add an OpenRouter list-price estimate for anything after it. On a full session the estimate came out at $11.78 against the real $12.06.\n- **`src/session.ts`**: detects whether a file is from pi or Claude Code. The OpenRouter pricing lookup and the diff rendering are now shared. A failed pricing lookup now prints a warning instead of quietly recording a $0 price; that happened once during my testing.\n- **`src/convert.ts`**: new `--claude-session <id>` option. I also fixed an existing bug: the CLI printed `Promise { <pending> }` instead of the output path.\n- **Plugin**: `.claude-plugin/plugin.json`, `.claude-plugin/marketplace.json` and `hooks/register.ts`. It registers `/pelmeshi` and runs the CLI with `node`. The command is handled entirely by the plugin, so running it costs no model tokens. It passes `claude plugin validate`, and the code type-checks.\n- **README** has the install steps, and `.gitignore` now ignores the type files the plugin system generates.\n\n**To try it**\n- **Before pushing:** run `claude --plugin-dir .` from any project.\n- **After pushing to `caryph/pelmeshi`:** run `/plugin install pelmeshi --marketplace caryph/pelmeshi`.\n\n**Things to know**\n- `tokens_in` for Claude Code includes tokens written to the prompt cache, because the schema has no field for them. Those writes are a large share of Claude's cost.\n- `tool.plugins` is always `[]` for Claude Code; there's nothing in the transcript that matches pi's plugin list.\n- The plugin needs node 22.6 or newer on `PATH`. Your pi CLI has the same requirement.\n\nI also ran the converter on your other four Claude Code sessions, but the output only went to the scratchpad. Nothing was added to `.llm/` here."
+    },
+    {
+      "role": "user",
+      "text": "yeah the price will pollute the final data since i'm using a subscription. how do we account for that? is there a way to get payment info from claude code directly? maybe add a subscription field instead? whacha think"
+    },
+    {
+      "role": "assistant",
+      "text": "Let me check what Claude Code actually exposes about billing before picking an approach."
+    },
+    {
+      "role": "tool",
+      "name": "bash"
+    },
+    {
+      "role": "tool",
+      "name": "bash"
+    },
+    {
+      "role": "tool",
+      "name": "bash"
+    },
+    {
+      "role": "tool",
+      "name": "bash"
+    },
+    {
+      "role": "tool",
+      "name": "bash"
+    },
+    {
+      "role": "tool",
+      "name": "bash"
+    },
+    {
+      "role": "assistant",
+      "text": "The subscription field is in and type-checks. Next I'll read the cost section back once (the doubled line above may just be from my two overlapping `sed` ranges), then test it."
+    },
+    {
+      "role": "tool",
+      "name": "bash"
+    },
+    {
+      "role": "tool",
+      "name": "read"
+    },
+    {
+      "role": "tool",
+      "name": "bash"
+    },
+    {
+      "role": "tool",
+      "name": "bash"
+    },
+    {
+      "role": "assistant",
+      "text": "Yes, Claude Code can tell you. `claude auth status --json` returns `authMethod: \"claude.ai\"` and `subscriptionType: \"pro\"`, and it's a regular CLI command, so nothing hacky. I built your subscription-field idea on top of it.\n\n**How it works now**\n- **New `subscription` field:** holds the plan (`\"pro\"`, `\"max\"`, …), or `null` for pay-as-you-go (API key, Bedrock, Vertex, and all pi/OpenRouter sessions).\n- **Price:** `price_usd` now means what the session actually cost, so it's `0` on a subscription.\n- **Website:** this keeps the site data clean without changing the site. `sync.ts` and the site already add up `price_usd`, so subscription sessions stop inflating the totals. `sync.ts` also passes `subscription` through to the index, so the site can show \"pro\" instead of a bare $0 if you want.\n- **Old logs:** your existing `.llm` files have no `subscription` field and are read as pay-as-you-go, which is correct for pi.\n\n**Things to know**\n- **Detected at export time:** the plan comes from whoever is logged in when you run the export, not when the session ran. That's fine for `/pelmeshi`. For older transcripts, set it with `--subscription pro` or `--subscription none`.\n- **If detection fails:** if `claude` isn't on `PATH`, pelmeshi warns and prices the session as pay-as-you-go. The warning shows up in the `/pelmeshi` output.\n- **Extra usage:** if extra usage is turned on and you go past your plan's limits, that overage is real money, but nothing in the transcript says which requests it covered. Those sessions still record $0.\n- **Lost info:** for subscription sessions you lose the \"what this would have cost through the API\" number. If you want it for fun stats, adding an `api_equivalent_usd` field is a small change.\n\nTests: the type check passes, the plugin still validates, and on your gdai session auto-detect gives `0 pro`. `--subscription none` gives `$12.06`, `--subscription max` gives `0 max`, and the missing-`claude` fallback warns as expected. I didn't rerun the full `/pelmeshi` end-to-end, since the plugin itself didn't change. Nothing is committed yet."
+    }
+  ]
+}

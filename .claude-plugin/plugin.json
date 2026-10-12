@@ -1,0 +1,8 @@
+{
+  "name": "pelmeshi",
+  "version": "1.0.0",
+  "description": "Export the current Claude Code session to .llm/ with /pelmeshi [comment]",
+  "author": {
+    "name": "caryph"
+  }
+}

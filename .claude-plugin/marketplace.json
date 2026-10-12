@@ -1,0 +1,13 @@
+{
+  "name": "pelmeshi",
+  "description": "pelmeshi: log LLM coding sessions into a searchable .llm/ catalogue",
+  "owner": {
+    "name": "caryph"
+  },
+  "plugins": [
+    {
+      "name": "pelmeshi",
+      "source": "./"
+    }
+  ]
+}

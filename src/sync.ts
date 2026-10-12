@@ -54,6 +54,7 @@ for (const p of projects) {
                 url: `/logs/p/${p.slug}/${f}`,
                 model: s.model?.name ?? "?",
                 price: readPrice(s),
+                subscription: s.subscription ?? null,
                 tokens: (s.stats?.tokens_in ?? 0)
                     + (s.stats?.tokens_out ?? 0)
                     + (s.stats?.cache_read ?? 0),
